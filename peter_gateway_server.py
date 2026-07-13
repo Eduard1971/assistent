@@ -95,6 +95,38 @@ SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SUPERVISOR_EMAIL = os.getenv("SUPERVISOR_EMAIL", "")
 
+
+def _build_mailboxes() -> List[Dict[str, Any]]:
+    """Zoznam schránok, ktoré server sleduje/z ktorých odosiela. 'sales' je vždy prítomná
+    (existujúce SALES_EMAIL/* premenné). Ďalšie schránky (napr. FLM hotline) sa pridajú, ak
+    majú nastavený vlastný e-mail + heslo - inak sa jednoducho nepollujú, nič nezlyhá."""
+    boxes = [{
+        "id": "sales",
+        "email": SALES_EMAIL,
+        "password": EMAIL_PASSWORD,
+        "imap_host": IMAP_HOST,
+        "imap_port": IMAP_PORT,
+        "smtp_host": SMTP_HOST,
+        "smtp_port": SMTP_PORT,
+    }]
+    flm_email = os.getenv("FLM_EMAIL", "").strip()
+    flm_password = os.getenv("FLM_EMAIL_PASSWORD", "")
+    if flm_email and flm_password:
+        boxes.append({
+            "id": "flm",
+            "email": flm_email,
+            "password": flm_password,
+            "imap_host": os.getenv("FLM_IMAP_HOST", IMAP_HOST),
+            "imap_port": int(os.getenv("FLM_IMAP_PORT", str(IMAP_PORT))),
+            "smtp_host": os.getenv("FLM_SMTP_HOST", SMTP_HOST),
+            "smtp_port": int(os.getenv("FLM_SMTP_PORT", str(SMTP_PORT))),
+        })
+    return boxes
+
+
+MAILBOXES = _build_mailboxes()
+MAILBOXES_BY_ID = {b["id"]: b for b in MAILBOXES}
+
 logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
     format="%(asctime)s [Peter-Gateway] %(levelname)s - %(message)s",
@@ -390,16 +422,15 @@ def store_message(message: Dict[str, Any]) -> bool:
         return False
 
 
-def fetch_new_emails(max_count: int = 20) -> List[Dict[str, Any]]:
-    if not EMAIL_PASSWORD:
-        return [{"error": "SALES_EMAIL_PASSWORD nie je nastavená v .env"}]
+def fetch_mailbox_emails(mailbox: Dict[str, Any], max_count: int) -> List[Dict[str, Any]]:
+    box_id = mailbox["id"]
     try:
-        mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
-        mail.login(SALES_EMAIL, EMAIL_PASSWORD)
+        mail = imaplib.IMAP4_SSL(mailbox["imap_host"], mailbox["imap_port"])
+        mail.login(mailbox["email"], mailbox["password"])
         mail.select("INBOX")
         _, ids = mail.search(None, "UNSEEN")
         email_ids = ids[0].split() if ids[0] else []
-        log.info("IMAP: %s nových emailov", len(email_ids))
+        log.info("IMAP[%s]: %s nových emailov", box_id, len(email_ids))
         results: List[Dict[str, Any]] = []
         for eid in email_ids[-max_count:]:
             _, data = mail.fetch(eid, "(RFC822)")
@@ -419,6 +450,7 @@ def fetch_new_emails(max_count: int = 20) -> List[Dict[str, Any]]:
             cc_raw = decode_header_value(msg.get("Cc", ""))
             item = {
                 "imap_id": eid.decode(),
+                "mailbox": box_id,
                 "from": from_raw,
                 "from_email": from_email,
                 "to_raw": to_raw,
@@ -438,35 +470,49 @@ def fetch_new_emails(max_count: int = 20) -> List[Dict[str, Any]]:
             store_message({
                 "channel": "email",
                 "direction": "in",
-                "message_id": message_id or f"imap:{eid.decode()}",
+                "message_id": message_id or f"imap:{box_id}:{eid.decode()}",
                 "conversation_id": item["conversation_id"],
                 "sender_id": from_email,
-                "recipient_id": SALES_EMAIL,
+                "recipient_id": mailbox["email"],
                 "subject": subject,
                 "body": body,
-                "metadata": {"imap_id": eid.decode(), "thread_id": thread_id, "to": item["to_list"], "cc": item["cc_list"]},
+                "metadata": {"mailbox": box_id, "imap_id": eid.decode(), "thread_id": thread_id, "to": item["to_list"], "cc": item["cc_list"]},
                 "created_at": utc_now(),
             })
         mail.logout()
         return results
     except imaplib.IMAP4.error as exc:
-        log.error("IMAP chyba: %s", exc)
-        return [{"error": f"IMAP login zlyhal: {exc}"}]
+        log.error("IMAP[%s] chyba: %s", box_id, exc)
+        return [{"error": f"IMAP login zlyhal ({box_id}): {exc}", "mailbox": box_id}]
     except Exception as exc:
-        log.exception("Email fetch chyba")
-        return [{"error": str(exc)}]
+        log.exception("Email fetch chyba (%s)", box_id)
+        return [{"error": str(exc), "mailbox": box_id}]
 
 
-def mark_email_read(imap_id: str) -> bool:
+def fetch_new_emails(max_count: int = 20) -> List[Dict[str, Any]]:
+    active = [b for b in MAILBOXES if b["password"]]
+    if not active:
+        return [{"error": "Žiadna schránka nemá nastavené heslo (SALES_EMAIL_PASSWORD / FLM_EMAIL_PASSWORD) v .env"}]
+    results: List[Dict[str, Any]] = []
+    for mailbox in active:
+        results.extend(fetch_mailbox_emails(mailbox, max_count))
+    return results
+
+
+def mark_email_read(imap_id: str, mailbox: str = "sales") -> bool:
+    box = MAILBOXES_BY_ID.get(mailbox)
+    if not box:
+        log.error("Mark email processed: neznáma schránka '%s'", mailbox)
+        return False
     try:
-        mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
-        mail.login(SALES_EMAIL, EMAIL_PASSWORD)
+        mail = imaplib.IMAP4_SSL(box["imap_host"], box["imap_port"])
+        mail.login(box["email"], box["password"])
         mail.select("INBOX")
         mail.store(str(imap_id), "+FLAGS", "\\Seen")
         mail.logout()
         return True
     except Exception as exc:
-        log.error("Mark email processed chyba: %s", exc)
+        log.error("Mark email processed chyba (%s): %s", mailbox, exc)
         return False
 
 
@@ -480,11 +526,14 @@ def send_email_smtp(
     cc: Optional[List[str]] = None,
     conversation_id: str = "",
     idempotency_key: str = "",
+    mailbox: str = "sales",
 ) -> Dict[str, Any]:
-    if not EMAIL_PASSWORD:
-        return {"ok": False, "error": "SALES_EMAIL_PASSWORD nie je nastavená v .env"}
+    box = MAILBOXES_BY_ID.get(mailbox) or MAILBOXES_BY_ID["sales"]
+    from_email = box["email"]
+    if not box["password"]:
+        return {"ok": False, "error": f"Heslo pre schránku '{mailbox}' nie je nastavené v .env"}
     attachments = attachments or []
-    cc_list = [x for x in (cc or []) if x and x.lower() not in {SALES_EMAIL.lower(), to.lower()}]
+    cc_list = [x for x in (cc or []) if x and x.lower() not in {from_email.lower(), to.lower()}]
     message_key = idempotency_key or make_message_key("email-out", "", f"{to}|{subject}|{body_text or body_html}|{attachments}")
     with db_conn() as conn:
         exists = conn.execute("SELECT 1 FROM messages WHERE message_key=?", (message_key,)).fetchone()
@@ -493,7 +542,7 @@ def send_email_smtp(
     try:
         msg = EmailMessage()
         msg["Subject"] = subject
-        msg["From"] = SALES_EMAIL
+        msg["From"] = from_email
         msg["To"] = to
         if cc_list:
             msg["Cc"] = ", ".join(cc_list)
@@ -524,10 +573,10 @@ def send_email_smtp(
             msg.add_attachment(path.read_bytes(), maintype=maintype, subtype=subtype, filename=path.name)
             attached.append(path.name)
         recipients = [to] + cc_list
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as smtp:
+        with smtplib.SMTP(box["smtp_host"], box["smtp_port"], timeout=30) as smtp:
             smtp.ehlo()
             smtp.starttls()
-            smtp.login(SALES_EMAIL, EMAIL_PASSWORD)
+            smtp.login(from_email, box["password"])
             smtp.send_message(msg, to_addrs=recipients)
         store_message({
             "message_key": message_key,
@@ -535,21 +584,21 @@ def send_email_smtp(
             "direction": "out",
             "message_id": msg.get("Message-ID", ""),
             "conversation_id": conversation_id or f"email:{reply_to_id or to}",
-            "sender_id": SALES_EMAIL,
+            "sender_id": from_email,
             "recipient_id": to,
             "subject": subject,
             "body": plain,
             "attachments": attachments,
-            "metadata": {"cc": cc_list, "reply_to_id": reply_to_id},
+            "metadata": {"cc": cc_list, "reply_to_id": reply_to_id, "mailbox": mailbox},
             "status": "sent",
             "created_at": utc_now(),
         })
         with db_conn() as conn:
             conn.execute(
                 "INSERT INTO email_log(direction,from_addr,to_addr,subject,body_preview,sent_at) VALUES(?,?,?,?,?,?)",
-                ("OUT", SALES_EMAIL, to, subject, plain[:300], utc_now()),
+                ("OUT", from_email, to, subject, plain[:300], utc_now()),
             )
-        log.info("Email odoslaný: To=%s | %s", to, subject)
+        log.info("Email odoslaný (%s): To=%s | %s", mailbox, to, subject)
         return {"ok": True, "attachments_sent": attached, "attachments_missing": missing, "cc_sent": cc_list, "message_key": message_key}
     except smtplib.SMTPAuthenticationError:
         return {"ok": False, "error": "SMTP autentifikácia zlyhala. Použi App Password."}
@@ -829,13 +878,14 @@ async def list_tools():
             "agent_id": {"type": "string"}, "limit": {"type": "integer", "default": 20}, "claim": {"type": "boolean", "default": True}}, ["agent_id"]),
         tool("ack_event", "Potvrdí úspešné alebo neúspešné spracovanie udalosti", {
             "event_id": {"type": "string"}, "ok": {"type": "boolean", "default": True}, "error": {"type": "string"}}, ["event_id"]),
-        tool("check_new_emails", "Skontroluje nové emaily", {"max_count": {"type": "integer", "default": 10}}),
-        tool("send_email", "Odošle email s prílohami", {
+        tool("check_new_emails", "Skontroluje nové emaily vo všetkých nakonfigurovaných schránkach (sales, flm, ...)", {"max_count": {"type": "integer", "default": 10}}),
+        tool("send_email", "Odošle email s prílohami z danej schránky (mailbox: sales|flm, predvolené sales)", {
             "to": {"type": "string"}, "subject": {"type": "string"}, "body_html": {"type": "string"},
             "body_text": {"type": "string"}, "reply_to_id": {"type": "string"}, "conversation_id": {"type": "string"},
             "idempotency_key": {"type": "string"}, "cc": {"type": "array", "items": {"type": "string"}},
-            "attachments": {"type": "array", "items": {"type": "string"}}}, ["to", "subject", "body_html"]),
-        tool("mark_email_processed", "Označí email ako spracovaný", {"imap_id": {"type": "string"}}, ["imap_id"]),
+            "attachments": {"type": "array", "items": {"type": "string"}}, "mailbox": {"type": "string", "default": "sales"}}, ["to", "subject", "body_html"]),
+        tool("mark_email_processed", "Označí email ako spracovaný v danej schránke", {
+            "imap_id": {"type": "string"}, "mailbox": {"type": "string", "default": "sales"}}, ["imap_id"]),
         tool("save_offer", "Uloží alebo aktualizuje ponuku", {"offer": {"type": "object"}}, ["offer"]),
         tool("list_offers", "Vráti ponuky", {"status": {"type": "string"}, "limit": {"type": "integer", "default": 100}}),
         tool("save_contract", "Uloží alebo aktualizuje zmluvu", {"contract": {"type": "object"}}, ["contract"]),
@@ -857,7 +907,7 @@ async def call_tool(name: str, arguments: Dict[str, Any]):
     elif name == "ack_event": result = ack_event(arguments["event_id"], bool(arguments.get("ok", True)), arguments.get("error", ""))
     elif name == "check_new_emails": result = fetch_new_emails(int(arguments.get("max_count", 10)))
     elif name == "send_email": result = send_email_smtp(**arguments)
-    elif name == "mark_email_processed": result = {"ok": mark_email_read(arguments["imap_id"])}
+    elif name == "mark_email_processed": result = {"ok": mark_email_read(arguments["imap_id"], arguments.get("mailbox", "sales"))}
     elif name == "save_offer": result = save_offer_db(arguments.get("offer", arguments))
     elif name == "list_offers": result = list_offers(arguments.get("status", ""), int(arguments.get("limit", 100)))
     elif name == "save_contract": result = save_contract_db(arguments.get("contract", arguments))
@@ -899,7 +949,9 @@ async def route_status(_: Request):
             "contracts": conn.execute("SELECT COUNT(*) c FROM contracts").fetchone()["c"],
             "watchdog_events": conn.execute("SELECT COUNT(*) c FROM watchdog_events").fetchone()["c"],
         }
-    return JSONResponse({**CAPABILITIES, "email": SALES_EMAIL, "db": str(DB_PATH), "offers_dir": str(OFFERS_DIR), "counts": counts})
+    return JSONResponse({**CAPABILITIES, "email": SALES_EMAIL,
+                          "mailboxes": [b["id"] for b in MAILBOXES if b["password"]],
+                          "db": str(DB_PATH), "offers_dir": str(OFFERS_DIR), "counts": counts})
 
 
 async def route_capabilities(_: Request): return JSONResponse(CAPABILITIES)
@@ -925,7 +977,9 @@ async def route_tool_save_offer(request: Request):
 async def route_tool_save_contract(request: Request):
     result = save_contract_db(await body_json(request)); return JSONResponse(result, status_code=200 if result.get("ok") else 400)
 async def route_tool_mark_email_processed(request: Request):
-    data = await body_json(request); result = {"ok": mark_email_read(data.get("imap_id", ""))}; return JSONResponse(result, status_code=200 if result["ok"] else 400)
+    data = await body_json(request)
+    result = {"ok": mark_email_read(data.get("imap_id", ""), data.get("mailbox", "sales"))}
+    return JSONResponse(result, status_code=200 if result["ok"] else 400)
 
 
 sse = SseServerTransport("/messages")
