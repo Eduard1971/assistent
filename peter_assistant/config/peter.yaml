@@ -1,0 +1,52 @@
+app:
+  name: Peter Assistant
+  scan_interval_seconds: 60
+  database: data/peter.db
+  log_file: logs/peter.log
+  health_host: 127.0.0.1
+  health_port: 8091
+
+models:
+  local:
+    enabled: true
+    url: ${OLLAMA_URL}
+    model: ${OLLAMA_MODEL}
+  writer:
+    enabled: true
+    provider: anthropic
+    model: ${CLAUDE_MODEL}
+
+channels:
+  email:
+    enabled: true
+    mcp_url: ${MCP_SERVER_URL}
+  telegram:
+    enabled: false
+    bot_token: ${TELEGRAM_BOT_TOKEN}
+  whatsapp:
+    enabled: false
+    provider: meta_cloud_api
+    access_token: ${WHATSAPP_ACCESS_TOKEN}
+    phone_number_id: ${WHATSAPP_PHONE_NUMBER_ID}
+
+sales:
+  sales_email: ${SALES_EMAIL}
+  supervisor_email: ${SUPERVISOR_EMAIL}
+  organization: Trestel SK, a.s.
+  salesperson: Peter / Obchodné oddelenie
+
+watchdog:
+  enabled: false
+  poll_seconds: 2
+  alert_channels: [email]
+  allowed_presence_window_seconds: 45
+  cameras:
+    - id: gate-1
+      name: Hlavný vstup
+      source: 0
+      enabled: false
+  access_events:
+    provider: json_file
+    path: data/access_events.jsonl
+  alerts:
+    email_to: ${SUPERVISOR_EMAIL}
