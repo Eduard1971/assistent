@@ -433,7 +433,7 @@ def fetch_mailbox_emails(mailbox: Dict[str, Any], max_count: int) -> List[Dict[s
         log.info("IMAP[%s]: %s nových emailov", box_id, len(email_ids))
         results: List[Dict[str, Any]] = []
         for eid in email_ids[-max_count:]:
-            _, data = mail.fetch(eid, "(RFC822)")
+            _, data = mail.fetch(eid, "(BODY.PEEK[])")
             if not data or not data[0] or not isinstance(data[0], tuple):
                 continue
             msg = email_lib.message_from_bytes(data[0][1])
