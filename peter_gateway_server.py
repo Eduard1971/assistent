@@ -437,6 +437,24 @@ def fetch_mailbox_emails(mailbox: Dict[str, Any], max_count: int) -> List[Dict[s
             if not data or not data[0] or not isinstance(data[0], tuple):
                 continue
             msg = email_lib.message_from_bytes(data[0][1])
+            x_mailer = decode_header_value(msg.get("X-Mailer", ""))
+            if x_mailer.strip().lower().startswith("peter-gateway"):
+                # Vlastný odoslaný email (send_email_smtp() ho vždy takto označí) sa vrátil
+                # späť do tej istej schránky, ktorú tento poll skenuje - typicky preto, že
+                # SALES_EMAIL a SUPERVISOR_EMAIL sú (alebo sa server domnieva, že sú) rovnaká
+                # adresa/alias. Bez tohto filtra by sa takýto email spracoval ako nový
+                # zákaznícky dopyt (so "zákazníkom" = vlastná schránka) a jeho telo, ktoré
+                # zvyčajne obsahuje inštrukciu "odpovedzte SCHVALUJEM PON-...", by
+                # PeterAssistant.classify() mohlo vyhodnotiť ako skutočné schválenie od
+                # supervízora - falošné schválenie bez toho, aby ho ktokoľvek reálne poslal.
+                log.warning("IMAP[%s]: preskakujem vlastný odoslaný email (X-Mailer=%s, id=%s) - "
+                            "over SALES_EMAIL/SUPERVISOR_EMAIL, nemali by byť rovnaká schránka",
+                            box_id, x_mailer, eid.decode())
+                try:
+                    mail.store(eid, "+FLAGS", "\\Seen")
+                except Exception:
+                    pass
+                continue
             from_raw = decode_header_value(msg.get("From", ""))
             match = re.search(r"<([^>]+)>", from_raw)
             from_email = (match.group(1) if match else from_raw).strip().lower()
